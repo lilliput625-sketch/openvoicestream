@@ -7085,6 +7085,13 @@ async def v2v_stream(ws: WebSocket):
             tts_voice       = cfg.get("tts_voice")
             tts_speaker_id = cfg.get("tts_speaker_id")
             tts_speed       = cfg.get("tts_speed")
+            tts_instruct    = cfg.get("tts_instruct")
+            if tts_instruct is not None:
+                if not isinstance(tts_instruct, str):
+                    raise TypeError("tts_instruct must be a string")
+                tts_instruct = tts_instruct.strip()
+                if len(tts_instruct) > 1024:
+                    raise ValueError("tts_instruct must be at most 1024 characters")
             # Resolve speaker once at config time — avoids mid-session changes
             # (e.g. unregister) affecting later sentences in the same session.
             tts_speaker_kwargs: dict = {}
@@ -8774,6 +8781,8 @@ async def v2v_stream(ws: WebSocket):
                             stream_kwargs.update(tts_speaker_kwargs)
                         elif tts_voice is not None:
                             stream_kwargs["voice"] = tts_voice  # deprecated
+                        if tts_instruct:
+                            stream_kwargs["instruct"] = tts_instruct
                         # Propagate the watchdog/barge-in cancellation into the
                         # backend generator.  Without this, the executor thread
                         # keeps waiting in WorkerIO after the outer task times

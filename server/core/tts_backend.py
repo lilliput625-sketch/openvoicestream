@@ -151,6 +151,7 @@ class TTSBackend(ABC):
 
 _TTS_REGISTRY: Dict[str, Tuple[str, str]] = {
     "jetson.trt_edge_llm": ("voxedge.backends.jetson.trt_edge_llm_tts", "TRTEdgeLLMTTSBackend"),
+    "jetson.codec_cpp": ("server.core.codec_cpp_tts", "CodecCppTTSBackend"),
     "jetson.matcha_trt":   ("voxedge.backends.jetson.matcha_trt",   "MatchaTRTBackend"),
     "jetson.kokoro_trt":   ("voxedge.backends.jetson.kokoro_trt",   "KokoroTRTBackend"),
     "jetson.moss_tts_nano":("voxedge.backends.jetson.moss_tts_nano","MossTtsNanoBackend"),
@@ -199,6 +200,19 @@ def create_tts_backend() -> TTSBackend:
     if spec == "jetson.sparktts":
         from server.core.voxedge_backend_config import build_sparktts_trt_config
         return cls(config=build_sparktts_trt_config(profile=current_profile()))
+    if spec == "jetson.codec_cpp":
+        from server.core.codec_cpp_tts import CodecCppTTSConfig
+        profile = current_profile()
+        settings = profile.get("tts_backend_config") or {}
+        return cls(config=CodecCppTTSConfig(
+            server_url=str(settings.get("server_url", "http://127.0.0.1:8623")),
+            model_id=str(profile.get("tts_model_id") or "qwen3-tts-customvoice"),
+            request_model=str(settings.get("request_model", "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice")),
+            default_voice=str(settings.get("default_voice", "ryan")),
+            sample_rate=int(settings.get("sample_rate", 24000)),
+            read_chunk_bytes=int(settings.get("read_chunk_bytes", 4096)),
+            read_timeout_s=float(settings.get("read_timeout_s", 1.0)),
+        ))
     if spec == "cpu.sherpa":
         from server.core.voxedge_backend_config import build_sherpa_tts_config
         return cls(config=build_sherpa_tts_config(profile=current_profile()))
