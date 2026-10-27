@@ -204,14 +204,35 @@ def create_tts_backend() -> TTSBackend:
         from server.core.codec_cpp_tts import CodecCppTTSConfig
         profile = current_profile()
         settings = profile.get("tts_backend_config") or {}
+        mode = str(settings.get("mode", "customvoice"))
+        default_request_model = (
+            "qwen3-tts-voicedesign"
+            if mode == "voicedesign"
+            else "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
+        )
         return cls(config=CodecCppTTSConfig(
             server_url=str(settings.get("server_url", "http://127.0.0.1:8623")),
+            mode=mode,
             model_id=str(profile.get("tts_model_id") or "qwen3-tts-customvoice"),
-            request_model=str(settings.get("request_model", "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice")),
+            request_model=str(settings.get("request_model", default_request_model)),
             default_voice=str(settings.get("default_voice", "ryan")),
+            default_instructions=str(settings.get("default_instructions", "")),
             sample_rate=int(settings.get("sample_rate", 24000)),
             read_chunk_bytes=int(settings.get("read_chunk_bytes", 4096)),
             read_timeout_s=float(settings.get("read_timeout_s", 1.0)),
+            manage_process=bool(settings.get("manage_process", False)),
+            process_command=tuple(str(v) for v in settings.get("process_command", [])),
+            process_cwd=settings.get("process_cwd"),
+            process_log_path=settings.get("process_log_path"),
+            startup_timeout_s=float(settings.get("startup_timeout_s", 180.0)),
+            auxiliary_command=tuple(str(v) for v in settings.get("auxiliary_command", [])),
+            auxiliary_cwd=settings.get("auxiliary_cwd"),
+            auxiliary_log_path=settings.get("auxiliary_log_path"),
+            auxiliary_ready_port=(
+                int(settings["auxiliary_ready_port"])
+                if settings.get("auxiliary_ready_port") is not None
+                else None
+            ),
         ))
     if spec == "cpu.sherpa":
         from server.core.voxedge_backend_config import build_sherpa_tts_config

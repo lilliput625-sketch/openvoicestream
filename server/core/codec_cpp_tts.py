@@ -10,10 +10,13 @@ import io
 import json
 import logging
 import socket
+import subprocess
+import time
 import wave
 from dataclasses import dataclass
+from pathlib import Path
 from urllib.parse import urlsplit
-from typing import Any, Callable, Iterator, Optional
+from typing import Any, Callable, Iterator, Optional, Sequence
 
 from voxedge.backends.base import TTSBackend, TTSCapability
 
@@ -23,12 +26,23 @@ logger = logging.getLogger(__name__)
 @dataclass(frozen=True)
 class CodecCppTTSConfig:
     server_url: str = "http://127.0.0.1:8623"
+    mode: str = "customvoice"
     model_id: str = "qwen3-tts-customvoice"
     request_model: str = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
     default_voice: str = "ryan"
+    default_instructions: str = ""
     sample_rate: int = 24000
     read_chunk_bytes: int = 4096
     read_timeout_s: float = 1.0
+    manage_process: bool = False
+    process_command: Sequence[str] = ()
+    process_cwd: Optional[str] = None
+    process_log_path: Optional[str] = None
+    startup_timeout_s: float = 180.0
+    auxiliary_command: Sequence[str] = ()
+    auxiliary_cwd: Optional[str] = None
+    auxiliary_log_path: Optional[str] = None
+    auxiliary_ready_port: Optional[int] = None
 
 
 _LANGUAGE_NAMES = {
@@ -56,23 +70,31 @@ _SPEAKER_IDS = {
 
 
 class CodecCppTTSBackend(TTSBackend):
-    """Stream the 1.7B CustomVoice model through a loopback codec.cpp server."""
+    """Stream a 1.7B model through a loopback codec.cpp server."""
 
-    supports_hot_reload = False
+    supports_hot_reload = True
 
     def __init__(self, config: CodecCppTTSConfig):
         self._config = config
         parsed = urlsplit(config.server_url)
         if parsed.scheme != "http" or not parsed.hostname:
             raise ValueError("codec.cpp server_url must be an http:// URL")
+        if config.mode not in ("customvoice", "voicedesign"):
+            raise ValueError("codec.cpp mode must be customvoice or voicedesign")
+        if config.manage_process and not config.process_command:
+            raise ValueError("codec.cpp managed process requires process_command")
         self._host = parsed.hostname
         self._port = parsed.port or 80
         self._base_path = parsed.path.rstrip("/")
         self._ready = False
+        self._process: Optional[subprocess.Popen] = None
+        self._log_handle = None
+        self._aux_process: Optional[subprocess.Popen] = None
+        self._aux_log_handle = None
 
     @property
     def name(self) -> str:
-        return "qwen3_tts_1_7b_customvoice_codec_cpp"
+        return f"qwen3_tts_1_7b_{self._config.mode}_codec_cpp"
 
     @property
     def model_id(self) -> str:
@@ -80,12 +102,14 @@ class CodecCppTTSBackend(TTSBackend):
 
     @property
     def capabilities(self) -> set[TTSCapability]:
-        return {
+        capabilities = {
             TTSCapability.BASIC_TTS,
             TTSCapability.STREAMING,
-            TTSCapability.MULTI_SPEAKER,
             TTSCapability.MULTI_LANGUAGE,
         }
+        if self._config.mode == "customvoice":
+            capabilities.add(TTSCapability.MULTI_SPEAKER)
+        return capabilities
 
     @property
     def sample_rate(self) -> int:
@@ -95,6 +119,8 @@ class CodecCppTTSBackend(TTSBackend):
         return http.client.HTTPConnection(self._host, self._port, timeout=timeout)
 
     def is_ready(self) -> bool:
+        if self._process is not None and self._process.poll() is not None:
+            return False
         conn = self._connection(timeout=0.5)
         try:
             conn.request("GET", f"{self._base_path}/health")
@@ -109,15 +135,113 @@ class CodecCppTTSBackend(TTSBackend):
             conn.close()
 
     def preload(self) -> None:
-        if not self.is_ready():
-            raise RuntimeError(
-                f"codec.cpp TTS server is not ready at {self._config.server_url}; "
-                "start it with qwen-tts-model customvoice"
+        if self._config.manage_process:
+            if self._process is not None and self._process.poll() is None:
+                return
+            log_path = self._config.process_log_path
+            if log_path:
+                Path(log_path).parent.mkdir(parents=True, exist_ok=True)
+                self._log_handle = open(log_path, "a", buffering=1)
+            stdout = self._log_handle if self._log_handle is not None else subprocess.DEVNULL
+            stderr = subprocess.STDOUT if self._log_handle is not None else subprocess.DEVNULL
+            self._process = subprocess.Popen(
+                list(self._config.process_command),
+                cwd=self._config.process_cwd,
+                stdout=stdout,
+                stderr=stderr,
+                start_new_session=True,
             )
 
+        deadline = time.monotonic() + self._config.startup_timeout_s
+        while time.monotonic() < deadline:
+            if self.is_ready():
+                self._start_auxiliary()
+                self._ready = True
+                return
+            if self._process is not None and self._process.poll() is not None:
+                break
+            time.sleep(0.5)
+        rc = self._process.poll() if self._process is not None else None
+        self.unload()
+        raise RuntimeError(
+            f"codec.cpp TTS server is not ready at {self._config.server_url} "
+            f"(process_rc={rc}, log={self._config.process_log_path})"
+        )
+
+    def _start_auxiliary(self) -> None:
+        command = list(self._config.auxiliary_command)
+        if not command:
+            return
+        log_path = self._config.auxiliary_log_path
+        if log_path:
+            Path(log_path).parent.mkdir(parents=True, exist_ok=True)
+            self._aux_log_handle = open(log_path, "a", buffering=1)
+        stdout = self._aux_log_handle if self._aux_log_handle is not None else subprocess.DEVNULL
+        stderr = subprocess.STDOUT if self._aux_log_handle is not None else subprocess.DEVNULL
+        self._aux_process = subprocess.Popen(
+            command,
+            cwd=self._config.auxiliary_cwd,
+            stdout=stdout,
+            stderr=stderr,
+            start_new_session=True,
+        )
+        port = self._config.auxiliary_ready_port
+        if port is None:
+            return
+        deadline = time.monotonic() + self._config.startup_timeout_s
+        while time.monotonic() < deadline:
+            if self._aux_process.poll() is not None:
+                break
+            try:
+                with socket.create_connection((self._host, port), timeout=0.5):
+                    return
+            except OSError:
+                time.sleep(0.25)
+        rc = self._aux_process.poll()
+        self._stop_auxiliary()
+        raise RuntimeError(
+            f"codec.cpp auxiliary process is not ready on {self._host}:{port} "
+            f"(process_rc={rc}, log={self._config.auxiliary_log_path})"
+        )
+
+    def _stop_auxiliary(self) -> None:
+        process = self._aux_process
+        self._aux_process = None
+        if process is not None and process.poll() is None:
+            try:
+                process.terminate()
+                process.wait(timeout=10)
+            except Exception:
+                try:
+                    process.kill()
+                    process.wait(timeout=5)
+                except Exception:
+                    logger.exception("codec.cpp auxiliary process cleanup failed")
+        if self._aux_log_handle is not None:
+            try:
+                self._aux_log_handle.close()
+            finally:
+                self._aux_log_handle = None
+
     def unload(self) -> None:
-        # The model process is deliberately managed by qwen-tts-model so it can
-        # be stopped before switching backends and releasing shared RAM.
+        self._stop_auxiliary()
+        process = self._process
+        self._process = None
+        if process is not None and process.poll() is None:
+            try:
+                process.terminate()
+                process.wait(timeout=10)
+            except Exception:
+                try:
+                    process.kill()
+                    process.wait(timeout=5)
+                except Exception:
+                    logger.exception("codec.cpp managed process cleanup failed")
+        if self._log_handle is not None:
+            try:
+                self._log_handle.close()
+            finally:
+                self._log_handle = None
         self._ready = False
 
     def _request(
@@ -130,7 +254,11 @@ class CodecCppTTSBackend(TTSBackend):
         try:
             conn.request(
                 "POST", path, body=body,
-                headers={"Content-Type": "application/json", "Accept": "audio/pcm"},
+                headers={
+                    "Content-Type": "application/json",
+                    "Accept": "audio/pcm",
+                    "Connection": "close",
+                },
             )
             resp = conn.getresponse()
             if resp.status != 200:
@@ -180,30 +308,31 @@ class CodecCppTTSBackend(TTSBackend):
     ) -> dict[str, Any]:
         lang_key = (language or "").strip().lower()
         lang_name = _LANGUAGE_NAMES.get(lang_key)
-        style = (instruct or "").strip()
+        style = (instruct or self._config.default_instructions).strip()
         instruction_parts = []
         if lang_name and lang_key not in ("auto",):
             instruction_parts.append(f"Speak in {lang_name}.")
         if style:
             instruction_parts.append(style)
-        requested_voice = voice or speaker
-        if requested_voice is None and lang_name:
-            requested_voice = _LANGUAGE_VOICES.get(lang_name.lower())
-        if requested_voice is None:
-            requested_voice = self._config.default_voice
-        requested_voice = _SPEAKER_IDS.get(str(requested_voice), str(requested_voice))
         payload: dict[str, Any] = {
             "model": self._config.request_model,
             "input": text,
             "response_format": response_format,
         }
-        if requested_voice:
-            payload["voice"] = str(requested_voice)
+        if self._config.mode == "customvoice":
+            requested_voice = voice or speaker
+            if requested_voice is None and lang_name:
+                requested_voice = _LANGUAGE_VOICES.get(lang_name.lower())
+            if requested_voice is None:
+                requested_voice = self._config.default_voice
+            requested_voice = _SPEAKER_IDS.get(str(requested_voice), str(requested_voice))
+            if requested_voice:
+                payload["voice"] = str(requested_voice)
         if instruction_parts:
             payload["instructions"] = " ".join(instruction_parts)
         return payload
 
-    def generate_streaming(
+    def _generate_streaming_impl(
         self, text: str, *, language: Optional[str] = None,
         speaker: Optional[str] = None, cancel_token: Optional[Any] = None,
         **kwargs: Any,
@@ -229,7 +358,7 @@ class CodecCppTTSBackend(TTSBackend):
             if chunk:
                 yield chunk
 
-    def synthesize(
+    def _synthesize_impl(
         self, text: str, speaker_id: Optional[int] = None,
         speed: Optional[float] = None, pitch_shift: Optional[float] = None,
         language: Optional[str] = None, **kwargs: Any,

@@ -181,6 +181,135 @@ def _split_vad_block(samples, events):
 app = FastAPI(title="Jetson Speech Service", version="2.0.0")
 
 
+_OPENAPI_REDUNDANT_CAPABILITY_PATHS = {
+    "/asr/capabilities",
+    "/tts/capabilities",
+    "/v1/tts/capabilities",
+}
+_OPENAPI_ASR_PATHS = {
+    "/asr",
+    "/v1/asr",
+    "/punctuate",
+    "/diarize",
+    "/v1/audio/transcriptions",
+}
+_OPENAPI_CLONING_PATHS = {
+    "/tts/speakers/register",
+    "/tts/speakers/{speaker_id}",
+    "/tts/voices/profile",
+    "/tts/voices/enroll",
+    "/tts/voices/{voice_id}",
+    "/speaker/embedding",
+    "/tts/clone",
+    "/tts/clone/embedding",
+    "/tts/clone/stream",
+    "/v1/tts/clone/embedding",
+    "/v1/tts/clone/embedding/stream",
+    "/v1/tts/clone/reference",
+    "/v1/tts/clone/reference/stream",
+}
+_OPENAPI_TTS_PATHS = {
+    "/tts/speakers",
+    "/tts/voices",
+    "/tts",
+    "/v1/tts",
+    "/v1/tts/speakers",
+    "/tts/stream",
+    "/v1/audio/speech",
+    "/v1/models",
+    "/admin/tts/runtime",
+    "/admin/tts/speakers/reload",
+}
+
+
+def _openapi_capability_snapshot():
+    from server.core.api_capabilities import build_capabilities
+    from server.core.profile_loader import current_profile
+
+    try:
+        profile = current_profile() or {}
+    except Exception:
+        profile = {}
+
+    tts_mgr = _get_tts_manager()
+    if tts_mgr is None:
+        tts_backend = _peek_tts_backend()
+    elif tts_mgr.is_ready():
+        try:
+            tts_backend = tts_mgr.get_backend_unsafe()
+        except Exception:
+            tts_backend = None
+    else:
+        tts_backend = None
+
+    asr_mgr = _get_asr_manager()
+    if asr_mgr is None:
+        asr_backend = _get_asr_backend()
+    elif asr_mgr.is_ready():
+        try:
+            asr_backend = asr_mgr.get_backend_unsafe()
+        except Exception:
+            asr_backend = None
+    else:
+        asr_backend = None
+
+    return build_capabilities(
+        tts_backend=tts_backend,
+        asr_backend=asr_backend,
+        tts_ready=bool(tts_backend and tts_backend.is_ready()),
+        asr_ready=bool(asr_backend and asr_backend.is_ready()),
+        tts_configured=bool(profile.get("tts_backend")) or tts_mgr is not None,
+        asr_configured=bool(profile.get("asr_backend")) or asr_mgr is not None,
+        profile=profile,
+        api_versions=_registered_capability_api_versions(),
+    )
+
+
+def _openapi_schema():
+    from fastapi.openapi.utils import get_openapi
+
+    schema = get_openapi(
+        title=app.title,
+        version=app.version,
+        description=app.description,
+        routes=app.routes,
+        openapi_version=app.openapi_version,
+    )
+    try:
+        capabilities = _openapi_capability_snapshot()
+    except Exception:
+        logger.exception("could not determine live API capabilities for OpenAPI")
+        capabilities = {}
+
+    tts = capabilities.get("tts") or {}
+    asr = capabilities.get("asr") or {}
+    remove_paths = set(_OPENAPI_REDUNDANT_CAPABILITY_PATHS)
+
+    if not tts:
+        remove_paths.update(_OPENAPI_TTS_PATHS)
+        remove_paths.update(_OPENAPI_CLONING_PATHS)
+    elif not tts.get("streaming", {}).get("supported", False):
+        remove_paths.add("/tts/stream")
+
+    if not asr.get("ready", False):
+        remove_paths.update(_OPENAPI_ASR_PATHS)
+    if not tts.get("cloning", {}).get("supported", False):
+        remove_paths.update(_OPENAPI_CLONING_PATHS)
+
+    model_id = str(tts.get("model_id") or "").lower()
+    if "1.7b" not in model_id or not any(
+        token in model_id for token in ("customvoice", "custom_voice")
+    ):
+        remove_paths.add("/v1/custom-voice/stream")
+
+    for path in remove_paths:
+        schema.get("paths", {}).pop(path, None)
+    return schema
+
+
+app.openapi = _openapi_schema
+
+
 # Week 2: HTTP middleware injects/propagates X-Request-ID and stores it
 # in the request_id contextvar so every log line from the handler can
 # include it. Never reads request body. Probes (/livez /readyz /health
@@ -1016,6 +1145,17 @@ async def shutdown_watchdog():
     Best-effort: any errors here are swallowed because the process is
     going away regardless.
     """
+    try:
+        from server.core.backend_manager import asr_manager, tts_manager
+        for manager_getter in (tts_manager, asr_manager):
+            try:
+                await manager_getter().shutdown()
+            except RuntimeError:
+                pass
+            except Exception:
+                logger.exception("backend manager shutdown raised")
+    except Exception:
+        logger.exception("backend manager teardown setup raised")
     try:
         from server.core import gpu_watchdog as _gw
         await _gw.stop()
@@ -6802,6 +6942,237 @@ async def _v2v_stream_via_engine(
     await engine.run(WebSocketTransport(ws, idle_timeout_s=_idle_timeout_s))
 
 
+@app.get(
+    "/v1/voice-design/stream",
+    tags=["VoiceDesign"],
+    summary="VoiceDesign multi-speaker WebSocket protocol",
+    description="""Connect by WebSocket to this same path on port 8622. Send a JSON `config` frame, then either complete `segment` frames or incremental `text_delta` frames, and finally `end`. Text deltas are grouped by speaker and flushed into complete sentences at punctuation boundaries; a speaker change, `flush`, or `end` emits the pending tail. New speakers can be registered after configuration with `speaker_update`. Numeric speed and pitch controls use the service DSP layer: speed ranges from 0.25 to 4.0 and pitch_shift from -24 to 24 semitones. Existing `segment` frames remain supported. The server returns JSON progress events and binary 24 kHz mono PCM16 audio frames.""",
+)
+async def voice_design_stream_docs():
+    """Expose the WebSocket protocol in OpenAPI/Swagger at /docs."""
+    return {
+        "transport": "WebSocket",
+        "websocket_path": "/v1/voice-design/stream",
+        "websocket_url": "ws://<jetson-ip>:8622/v1/voice-design/stream",
+        "audio": "24 kHz, mono, signed 16-bit little-endian PCM; returned as binary frames",
+        "limits": {"segments_per_connection": 32, "text_characters_per_segment": 4000,
+                   "speaker_profiles": 12, "instruction_characters": 2000, "speed_range": [0.25, 4.0], "pitch_shift_range_semitones": [-24, 24]},
+        "request_frames": [
+            {"type": "config", "language": "English", "speed": 1.0, "pitch_shift": 0.0,
+             "default_speaker": "narrator", "speakers": {"narrator": {"instructions": "A calm, warm voice.", "speed": 0.95, "pitch_shift": -1.0}, "guest": "A brighter voice."}},
+            {"type": "text_delta", "speaker": "narrator", "text": "The rain has "},
+            {"type": "text_delta", "speaker": "narrator", "speed": 1.05, "pitch_shift": 2.0, "text": "stopped. Then let's go "},
+            {"type": "text_delta", "speaker": "guest", "text": "home."},
+            {"type": "speaker_update", "speakers": {"late_guest": "A new, bright voice introduced later."}},
+            {"type": "text_delta", "speaker": "late_guest", "text": "A new speaker can begin here."},
+            {"type": "flush"},
+            {"type": "end"},
+            {"type": "segment", "instructions": "A soft, reassuring voice.", "text": "Legacy complete segment."},
+        ],
+        "response_frames": [
+            "JSON text events: ready, configured, speaker_updated, text_buffered, text_flushed, segment_started, segment_done, error, stream_done",
+            "Binary frames: sequential PCM audio chunks for each segment",
+        ],
+        "example": {
+            "config": {"type": "config", "language": "English", "default_speaker": "narrator",
+                       "speakers": {"narrator": "A calm, warm voice.",
+                                    "guest": "A brighter voice with quiet confidence."}},
+            "segments": [
+                {"type": "segment", "speaker": "narrator", "text": "The rain has stopped."},
+                {"type": "segment", "speaker": "guest", "text": "Then let's take the long way home."},
+            ],
+            "end": {"type": "end"},
+        },
+    }
+
+
+@app.websocket("/v1/voice-design/stream")
+async def voice_design_stream(ws: WebSocket):
+    """Proxy VoiceDesign audio/control frames to the loopback-only adapter."""
+    from websockets.asyncio.client import connect
+
+    await ws.accept()
+    upstream_url = os.environ.get(
+        "OVS_VOICEDESIGN_WS_UPSTREAM",
+        "ws://127.0.0.1:8624/v1/voice-design/stream",
+    )
+    client_disconnected = False
+    try:
+        async with connect(
+            upstream_url,
+            open_timeout=5,
+            max_size=1_048_576,
+            max_queue=16,
+            ping_interval=20,
+            ping_timeout=20,
+        ) as upstream:
+            async def client_to_upstream():
+                nonlocal client_disconnected
+                while True:
+                    frame = await ws.receive()
+                    if frame["type"] == "websocket.disconnect":
+                        client_disconnected = True
+                        return
+                    if frame.get("text") is not None:
+                        await upstream.send(frame["text"])
+                    elif frame.get("bytes") is not None:
+                        await upstream.send(frame["bytes"])
+
+            async def upstream_to_client():
+                async for frame in upstream:
+                    if isinstance(frame, bytes):
+                        await ws.send_bytes(frame)
+                    else:
+                        await ws.send_text(frame)
+
+            pumps = {
+                asyncio.create_task(client_to_upstream()),
+                asyncio.create_task(upstream_to_client()),
+            }
+            try:
+                done, pending = await asyncio.wait(
+                    pumps, return_when=asyncio.FIRST_COMPLETED
+                )
+                for task in done:
+                    task.result()
+            finally:
+                for task in pumps:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*pumps, return_exceptions=True)
+
+        if not client_disconnected:
+            await ws.close(code=1000)
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        logger.exception("VoiceDesign WebSocket proxy failed")
+        if not client_disconnected:
+            try:
+                await ws.send_json({
+                    "type": "error",
+                    "error": "VoiceDesign backend unavailable; verify its local model worker is running.",
+                })
+                await ws.close(code=1013, reason="VoiceDesign backend unavailable")
+            except Exception:
+                pass
+
+
+
+@app.get(
+    "/v1/custom-voice/stream",
+    tags=["CustomVoice"],
+    summary="Instruction-controlled CustomVoice WebSocket protocol",
+    description="""Connect by WebSocket to this path on port 8622. Configure one or more Qwen built-in speakers and optional per-speaker delivery instructions, then send ordered text segments and an end frame. Each segment may override its speaker or instructions. The response contains JSON progress events and binary 24 kHz mono PCM16 audio. This endpoint shares the 1.7B GGUF runtime with VoiceDesign and switches the model before each WebSocket session.""",
+)
+async def custom_voice_stream_docs():
+    """Expose the CustomVoice WebSocket protocol in OpenAPI/Swagger at /docs."""
+    return {
+        "transport": "WebSocket",
+        "websocket_path": "/v1/custom-voice/stream",
+        "websocket_url": "ws://<jetson-ip>:8622/v1/custom-voice/stream",
+        "audio": "24 kHz, mono, signed 16-bit little-endian PCM; returned as binary frames",
+        "model": "Qwen3-TTS 1.7B CustomVoice GGUF; supports an optional natural-language instructions field",
+        "limits": {"segments_per_connection": 32, "text_characters_per_segment": 4000,
+                   "speaker_profiles": 12, "instruction_characters": 2000},
+        "request_frames": [
+            {"type": "config", "language": "English", "default_speaker": "narrator",
+             "speakers": {"narrator": {"voice": "Ryan", "instructions": "Speak warmly and gently."},
+                          "guest": {"voice": "Aiden", "instructions": "Speak with quiet confidence."}}},
+            {"type": "segment", "speaker": "narrator", "text": "The rain has stopped."},
+            {"type": "segment", "speaker": "guest", "text": "Then let us take the long way home."},
+            {"type": "segment", "speaker": "narrator", "instructions": "Speak softly, with a reassuring tone.",
+             "text": "Take a slow breath."},
+            {"type": "end"},
+        ],
+        "response_frames": [
+            "JSON text events: ready, configured, segment_started, segment_done, error, stream_done",
+            "Binary frames: sequential PCM audio chunks for each segment",
+        ],
+        "example": {
+            "config": {"type": "config", "language": "English", "default_speaker": "narrator",
+                       "speakers": {"narrator": {"voice": "Ryan", "instructions": "Speak warmly."},
+                                    "guest": {"voice": "Aiden", "instructions": "Speak with quiet confidence."}}},
+            "segments": [
+                {"type": "segment", "speaker": "narrator", "text": "The rain has stopped."},
+                {"type": "segment", "speaker": "guest", "text": "Then let us take the long way home."},
+            ],
+            "end": {"type": "end"},
+        },
+    }
+
+
+@app.websocket("/v1/custom-voice/stream")
+async def custom_voice_stream(ws: WebSocket):
+    """Proxy CustomVoice frames to the shared, loopback-only 1.7B model adapter."""
+    from websockets.asyncio.client import connect
+
+    await ws.accept()
+    upstream_url = os.environ.get(
+        "OVS_CUSTOMVOICE_WS_UPSTREAM",
+        "ws://127.0.0.1:8624/v1/custom-voice/stream",
+    )
+    client_disconnected = False
+    try:
+        async with connect(
+            upstream_url,
+            open_timeout=5,
+            max_size=1_048_576,
+            max_queue=16,
+            ping_interval=20,
+            ping_timeout=20,
+        ) as upstream:
+            async def client_to_upstream():
+                nonlocal client_disconnected
+                while True:
+                    frame = await ws.receive()
+                    if frame["type"] == "websocket.disconnect":
+                        client_disconnected = True
+                        return
+                    if frame.get("text") is not None:
+                        await upstream.send(frame["text"])
+                    elif frame.get("bytes") is not None:
+                        await upstream.send(frame["bytes"])
+
+            async def upstream_to_client():
+                async for frame in upstream:
+                    if isinstance(frame, bytes):
+                        await ws.send_bytes(frame)
+                    else:
+                        await ws.send_text(frame)
+
+            pumps = {
+                asyncio.create_task(client_to_upstream()),
+                asyncio.create_task(upstream_to_client()),
+            }
+            try:
+                done, pending = await asyncio.wait(
+                    pumps, return_when=asyncio.FIRST_COMPLETED
+                )
+                for task in done:
+                    task.result()
+            finally:
+                for task in pumps:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*pumps, return_exceptions=True)
+
+        if not client_disconnected:
+            await ws.close(code=1000)
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        logger.exception("CustomVoice WebSocket proxy failed")
+        if not client_disconnected:
+            try:
+                await ws.send_json({
+                    "type": "error",
+                    "error": "CustomVoice backend unavailable; verify the shared local 1.7B model adapter is running.",
+                })
+                await ws.close(code=1013, reason="CustomVoice backend unavailable")
+            except Exception:
+                pass
+
 @app.websocket("/v2v/stream")
 async def v2v_stream(ws: WebSocket):
     """Unified bi-directional WebSocket: speech in, partials + audio out.
@@ -7085,7 +7456,20 @@ async def v2v_stream(ws: WebSocket):
             tts_voice       = cfg.get("tts_voice")
             tts_speaker_id = cfg.get("tts_speaker_id")
             tts_speed       = cfg.get("tts_speed")
+            tts_pitch_shift = cfg.get("tts_pitch_shift", cfg.get("tts_pitch"))
             tts_instruct    = cfg.get("tts_instruct")
+            if tts_speed is not None:
+                if isinstance(tts_speed, bool) or not isinstance(tts_speed, (int, float)):
+                    raise TypeError("tts_speed must be a number")
+                tts_speed = float(tts_speed)
+                if not 0.25 <= tts_speed <= 4.0:
+                    raise ValueError("tts_speed must be between 0.25 and 4.0")
+            if tts_pitch_shift is not None:
+                if isinstance(tts_pitch_shift, bool) or not isinstance(tts_pitch_shift, (int, float)):
+                    raise TypeError("tts_pitch_shift must be a number")
+                tts_pitch_shift = float(tts_pitch_shift)
+                if not -24.0 <= tts_pitch_shift <= 24.0:
+                    raise ValueError("tts_pitch_shift must be between -24 and 24 semitones")
             if tts_instruct is not None:
                 if not isinstance(tts_instruct, str):
                     raise TypeError("tts_instruct must be a string")
@@ -8794,7 +9178,10 @@ async def v2v_stream(ws: WebSocket):
                         # so Mock/RK/Sherpa adapters and the TRT worker bridge
                         # receive the event without backend-specific branching.
                         stream_kwargs["cancel_token"] = stop_event
-                        if tts_speed is not None:    stream_kwargs["speed"] = tts_speed
+                        if tts_speed is not None:
+                            stream_kwargs["speed"] = tts_speed
+                        if tts_pitch_shift is not None:
+                            stream_kwargs["pitch_shift"] = tts_pitch_shift
                         # FIX_C: use the manager-acquired backend so a reload
                         # waiting for drain sees this request as inflight.
                         for chunk in synth_be.generate_streaming(s, **stream_kwargs):
@@ -9355,6 +9742,205 @@ class BackendReloadRequest(BaseModel):
     drain_timeout_s: Optional[float] = None
 
 
+class ProviderRequest(BaseModel):
+    provider: str
+    action: Literal["load", "unload"] = "load"
+    drain_timeout_s: Optional[float] = None
+
+
+_QWEN_PROVIDERS = {
+    "base": {
+        "display_name": "Qwen3-TTS Base 0.6B",
+        "filename": "qwen3-tts-native.json",
+    },
+    "customvoice": {
+        "display_name": "Qwen3-TTS CustomVoice 1.7B",
+        "filename": "qwen3-tts-1.7b-customvoice-gguf.json",
+    },
+    "voicedesign": {
+        "display_name": "Qwen3-TTS VoiceDesign 1.7B",
+        "filename": "qwen3-tts-1.7b-voicedesign-gguf.json",
+    },
+}
+
+
+def _qwen_profile_root():
+    from pathlib import Path
+    configured = os.environ.get("OVS_QWEN_MODEL_ROOT")
+    if configured:
+        return Path(configured)
+    profile_json = os.environ.get("OVS_PROFILE_JSON")
+    if profile_json:
+        return Path(profile_json).resolve().parent
+    return Path("/home/jetson/qwen-tts-local")
+
+
+def _provider_catalog():
+    import json
+    root = _qwen_profile_root()
+    entries = []
+    for provider, spec in _QWEN_PROVIDERS.items():
+        path = root / spec["filename"]
+        entry = {
+            "provider": provider,
+            "display_name": spec["display_name"],
+            "available": path.is_file(),
+            "profile_name": None,
+            "model_id": None,
+            "profile_path": str(path),
+        }
+        if path.is_file():
+            try:
+                profile = json.loads(path.read_text(encoding="utf-8"))
+                entry["profile_name"] = profile.get("name")
+                entry["model_id"] = profile.get("tts_model_id")
+            except Exception:
+                entry["available"] = False
+        entries.append(entry)
+    return entries
+
+
+def _resolve_provider_ref(provider: str):
+    from pathlib import Path
+    normalized = provider.strip()
+    key = normalized.lower().replace("_", "-")
+    for entry in _provider_catalog():
+        if (
+            key == entry["provider"]
+            or normalized == entry["profile_name"]
+            or normalized == Path(entry["profile_path"]).stem
+        ):
+            if not entry["available"]:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"error": "provider_unavailable", "provider": normalized},
+                )
+            return entry
+    raise HTTPException(
+        status_code=404,
+        detail={
+            "error": "provider_not_found",
+            "provider": normalized,
+            "available": [entry["provider"] for entry in _provider_catalog()],
+        },
+    )
+
+
+def _provider_alias(profile_name: str | None) -> str | None:
+    if profile_name is None:
+        return None
+    for entry in _provider_catalog():
+        if entry["profile_name"] == profile_name:
+            return entry["provider"]
+    return profile_name
+
+
+def _resident_provider_names(mgr) -> list[str]:
+    status = mgr.status()
+    provider = _provider_alias(status.get("provider"))
+    return [provider] if status.get("resident") and provider else []
+
+
+@app.get("/v1/providers")
+async def providers():
+    """List the supported TTS providers and the single resident provider."""
+    from server.core.backend_manager import tts_manager
+    try:
+        mgr = tts_manager()
+        status = mgr.status()
+    except RuntimeError:
+        status = {"state": "init", "provider": None, "resident": False}
+    current = _provider_alias(status.get("provider"))
+    return {
+        "object": "list",
+        "max_resident": 1,
+        "current": current,
+        "resident_providers": _resident_provider_names(mgr) if "mgr" in locals() else [],
+        "data": _provider_catalog(),
+    }
+
+
+@app.get("/admin/provider/status")
+async def admin_provider_status(_: None = Depends(_admin_dep())):
+    from server.core.backend_manager import tts_manager
+    mgr = tts_manager()
+    status = mgr.status()
+    return {
+        "max_resident": 1,
+        "current": _provider_alias(status.get("provider")),
+        "resident_providers": _resident_provider_names(mgr),
+        "backend": status,
+        "providers": _provider_catalog(),
+    }
+
+
+@app.post("/admin/provider")
+async def admin_provider(
+    payload: ProviderRequest,
+    _: None = Depends(_admin_dep()),
+):
+    """Load or unload one provider, keeping at most one TTS provider resident."""
+    from server.core.backend_manager import tts_manager
+    mgr = tts_manager()
+    entry = _resolve_provider_ref(payload.provider)
+    if payload.drain_timeout_s is not None and payload.drain_timeout_s <= 0:
+        raise HTTPException(
+            status_code=422,
+            detail={"error": "drain_timeout_s must be greater than zero"},
+        )
+
+    status = mgr.status()
+    current = status.get("provider")
+    if payload.action == "unload":
+        if not status.get("resident"):
+            result = {
+                "status": "already_unloaded",
+                "kind": "tts",
+                "provider": entry["provider"],
+                "resident_providers": [],
+            }
+        elif current != entry["profile_name"]:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "provider_not_resident",
+                    "requested": entry["provider"],
+                    "resident": current,
+                },
+            )
+        else:
+            result = await mgr.unload(
+                reason=f"provider:{entry['provider']}",
+                drain_timeout_s=payload.drain_timeout_s,
+            )
+    elif current == entry["profile_name"] and status.get("resident"):
+        result = {
+            "status": "already_loaded",
+            "kind": "tts",
+            "provider": entry["provider"],
+            "resident_providers": _resident_provider_names(mgr),
+        }
+    else:
+        result = await mgr.reload(
+            entry["profile_path"],
+            reason=f"provider:{entry['provider']}",
+            drain_timeout_s=payload.drain_timeout_s,
+        )
+
+    after = mgr.status()
+    result.update(
+        {
+            "provider": entry["provider"],
+            "profile_name": entry["profile_name"],
+            "model_id": entry["model_id"],
+            "max_resident": 1,
+            "resident_providers": _resident_provider_names(mgr),
+            "state": after["state"],
+        }
+    )
+    return result
+
+
 @app.post("/admin/backend/reload")
 async def admin_backend_reload(
     payload: BackendReloadRequest,
@@ -9366,11 +9952,11 @@ async def admin_backend_reload(
         mgr = tts_manager()
     else:  # "asr"  (Literal already constrains the values)
         mgr = asr_manager()
-    # drain_timeout_s override is plumbed into the request schema for
-    # forward compatibility; the manager does not yet expose a setter,
-    # so we ignore it for now (TODO: surface a per-call drain timeout
-    # on BackendManager.reload).
-    return await mgr.reload(payload.profile, reason="admin")
+    return await mgr.reload(
+        payload.profile,
+        reason="admin",
+        drain_timeout_s=payload.drain_timeout_s,
+    )
 
 
 @app.get("/admin/backend/status")

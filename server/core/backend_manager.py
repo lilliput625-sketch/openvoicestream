@@ -69,6 +69,7 @@ def _emit_reload(result: str) -> None:
 
 class BackendState(str, Enum):
     INIT = "init"
+    UNLOADED = "unloaded"
     READY = "ready"
     DRAINING = "draining"
     RELOADING = "reloading"
@@ -226,6 +227,8 @@ class BackendManager(Generic[T]):
         return {
             "state": self._state.value,
             "profile_name": self.profile_name,
+            "provider": self.profile_name if self._current is not None else None,
+            "resident": self._current is not None,
             "backend_name": self.backend_name,
             "inflight_http": self._inflight_http,
             "inflight_ws": len(self._ws_handles),
@@ -315,6 +318,7 @@ class BackendManager(Generic[T]):
         profile_ref: str | None = None,
         *,
         reason: str = "admin",
+        drain_timeout_s: float | None = None,
     ) -> dict:
         """Hot-swap the backend, optionally re-applying a profile.
 
@@ -334,17 +338,24 @@ class BackendManager(Generic[T]):
 
         async with self._reload_lock:
             # 1. Pre-conditions ------------------------------------------------
-            if self._state != BackendState.READY or self._current is None:
+            if self._state not in (BackendState.READY, BackendState.UNLOADED):
                 raise HTTPException(
                     status_code=409,
                     detail={"error": "backend_not_ready", "state": self._state.value},
+                )
+            if self._current is None and profile_ref is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"error": "provider_required", "state": self._state.value},
                 )
 
             # PR5 / FIX_A: backend self-reports whether it can truly release
             # resources in-process. Refuse early (before drain) when the live
             # backend doesn't support hot reload — restarting the whole
             # process is the supported path for those (Jetson in-process TRT).
-            if not getattr(self._current, "supports_hot_reload", False):
+            if self._current is not None and not getattr(
+                self._current, "supports_hot_reload", False
+            ):
                 raise HTTPException(
                     status_code=400,
                     detail={
@@ -355,9 +366,11 @@ class BackendManager(Generic[T]):
                 )
 
             # 2. Snapshot old state -------------------------------------------
-            old_backend: T = self._current  # type: ignore[assignment]
+            old_backend: T | None = self._current
             old_profile = dict(profile_loader.current_profile() or {})
-            old_profile_name = old_profile.get("name")
+            old_profile_name = (
+                old_profile.get("name") if old_backend is not None else None
+            )
             # FIX_4: rollback must re-apply via the *same* reference we used to
             # load this profile (could be a custom path). Fall back to the
             # profile's logical name if no prior ref is recorded (e.g. the
@@ -402,30 +415,33 @@ class BackendManager(Generic[T]):
                     )
 
             # 4. Drain ---------------------------------------------------------
-            async with self._state_lock:
-                self._state = BackendState.DRAINING
-            _emit_state(self.name, self._state)
-
-            await self._force_close_ws_sessions()
-            drained = await self._wait_for_http_drain(self._drain_timeout_s)
-            if not drained:
-                logger.warning(
-                    "BackendManager[%s] drain timed out; refusing unsafe reload",
-                    self.name,
-                )
+            drained = True
+            timeout_s = self._drain_timeout_s if drain_timeout_s is None else drain_timeout_s
+            if old_backend is not None:
                 async with self._state_lock:
-                    self._state = BackendState.READY
+                    self._state = BackendState.DRAINING
                 _emit_state(self.name, self._state)
-                _emit_reload("drain_timeout")
-                raise HTTPException(
-                    status_code=409,
-                    detail={
-                        "error": "backend_drain_timeout",
-                        "kind": self.name,
-                        "inflight_http": self._inflight_http,
-                        "timeout_s": self._drain_timeout_s,
-                    },
-                )
+
+                await self._force_close_ws_sessions()
+                drained = await self._wait_for_http_drain(timeout_s)
+                if not drained:
+                    logger.warning(
+                        "BackendManager[%s] drain timed out; refusing unsafe reload",
+                        self.name,
+                    )
+                    async with self._state_lock:
+                        self._state = BackendState.READY
+                    _emit_state(self.name, self._state)
+                    _emit_reload("drain_timeout")
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "error": "backend_drain_timeout",
+                            "kind": self.name,
+                            "inflight_http": self._inflight_http,
+                            "timeout_s": timeout_s,
+                        },
+                    )
 
             # 5. Reload --------------------------------------------------------
             async with self._state_lock:
@@ -435,12 +451,13 @@ class BackendManager(Generic[T]):
 
             new_backend: T | None = None
             try:
-                try:
-                    self._unloader(old_backend)
-                except Exception:
-                    logger.exception(
-                        "BackendManager[%s] old unload raised; continuing", self.name
-                    )
+                if old_backend is not None:
+                    try:
+                        self._unloader(old_backend)
+                    except Exception:
+                        logger.exception(
+                            "BackendManager[%s] old unload raised; continuing", self.name
+                        )
 
                 if profile_ref is not None:
                     profile_loader.apply_profile(
@@ -541,6 +558,97 @@ class BackendManager(Generic[T]):
                             "rollback_error": str(rb_exc),
                         },
                     ) from rb_exc
+
+
+    async def unload(
+        self,
+        *,
+        reason: str = "admin",
+        drain_timeout_s: float | None = None,
+    ) -> dict:
+        """Drain this manager and release its resident provider."""
+        if self._reload_lock.locked():
+            raise HTTPException(
+                status_code=409,
+                detail={"error": "backend_operation_in_progress"},
+            )
+
+        async with self._reload_lock:
+            if self._state != BackendState.READY or self._current is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"error": "backend_not_ready", "state": self._state.value},
+                )
+            if not getattr(self._current, "supports_hot_reload", False):
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "error": "hot_reload_not_supported",
+                        "kind": self.name,
+                        "backend": _backend_name_of(self._current),
+                    },
+                )
+
+            provider = self.profile_name
+            timeout_s = self._drain_timeout_s if drain_timeout_s is None else drain_timeout_s
+            async with self._state_lock:
+                self._state = BackendState.DRAINING
+            _emit_state(self.name, self._state)
+
+            await self._force_close_ws_sessions()
+            if not await self._wait_for_http_drain(timeout_s):
+                async with self._state_lock:
+                    self._state = BackendState.READY
+                _emit_state(self.name, self._state)
+                _emit_reload("drain_timeout")
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "error": "backend_drain_timeout",
+                        "kind": self.name,
+                        "inflight_http": self._inflight_http,
+                        "timeout_s": timeout_s,
+                    },
+                )
+
+            backend = self._current
+            async with self._state_lock:
+                self._state = BackendState.RELOADING
+            _emit_state(self.name, self._state)
+            self._current = None
+            try:
+                self._unloader(backend)
+            except Exception as exc:
+                async with self._state_lock:
+                    self._state = BackendState.FAILED
+                _emit_state(self.name, self._state)
+                _emit_reload("unload_failed")
+                raise HTTPException(
+                    status_code=500,
+                    detail={
+                        "error": "backend_unload_failed",
+                        "kind": self.name,
+                        "message": str(exc),
+                    },
+                ) from exc
+
+            async with self._state_lock:
+                self._state = BackendState.UNLOADED
+            _emit_state(self.name, self._state)
+            _emit_reload("unloaded")
+            logger.info(
+                "BackendManager[%s] unloaded provider %s (reason=%s)",
+                self.name,
+                provider,
+                reason,
+            )
+            return {
+                "status": "unloaded",
+                "kind": self.name,
+                "provider": provider,
+                "backend_name": "",
+                "resident_providers": [],
+            }
 
 
 # ---------------------------------------------------------------------------

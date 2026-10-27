@@ -443,12 +443,62 @@ def test_admin_backend_reload_success_swaps_backend(client, monkeypatch):
     assert body["kind"] == "tts"
 
 
-def test_admin_tts_speakers_reload(client):
-    """The speakers reload route still works under the new wiring."""
-    r = client.post("/admin/tts/speakers/reload")
+def test_provider_endpoint_requires_provider(client):
+    r = client.post("/admin/provider", json={"action": "load"})
+    assert r.status_code == 422, r.text
+
+
+def test_provider_endpoint_unloads_then_loads_one_provider(
+    client, monkeypatch, tmp_path
+):
+    """The provider contract requires a provider and never reports >1 resident."""
+    from server.core import profile_loader
+
+    customvoice = tmp_path / "qwen3-tts-1.7b-customvoice-gguf.json"
+    voicedesign = tmp_path / "qwen3-tts-1.7b-voicedesign-gguf.json"
+    customvoice.write_text(json.dumps({
+        "name": "customvoice-test",
+        "tts_backend": "jetson.trt_edge_llm",
+        "tts_model_id": "qwen3-tts-customvoice",
+        "env": {},
+    }))
+    voicedesign.write_text(json.dumps({
+        "name": "voicedesign-test",
+        "tts_backend": "jetson.trt_edge_llm",
+        "tts_model_id": "qwen3-tts-voicedesign",
+        "env": {},
+    }))
+    monkeypatch.setenv("OVS_QWEN_MODEL_ROOT", str(tmp_path))
+    active = {"profile": {"name": "customvoice-test"}}
+    monkeypatch.setattr(profile_loader, "current_profile", lambda: active["profile"])
+    monkeypatch.setattr(
+        profile_loader,
+        "apply_profile",
+        lambda ref, *, overrides=None, resolve_engines=False, kind=None: active.update(
+            profile=json.loads(Path(ref).read_text())
+        ),
+    )
+
+    r = client.post(
+        "/admin/provider",
+        json={"provider": "customvoice", "action": "unload"},
+    )
     assert r.status_code == 200, r.text
     body = r.json()
-    assert body["reloaded"] is True
+    assert body["status"] == "unloaded"
+    assert body["state"] == "unloaded"
+    assert body["resident_providers"] == []
+
+    r = client.post(
+        "/admin/provider",
+        json={"provider": "voicedesign", "action": "load"},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["status"] == "reloaded"
+    assert body["provider"] == "voicedesign"
+    assert body["max_resident"] == 1
+    assert body["resident_providers"] == ["voicedesign"]
 
 
 # ---------------------------------------------------------------------------

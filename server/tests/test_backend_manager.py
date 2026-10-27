@@ -211,6 +211,31 @@ async def test_reload_calls_unload_on_old():
 
 
 @asynctest
+async def test_unload_releases_provider_and_allows_reload():
+    unloads = []
+    mgr = _make_mgr(unload_calls=unloads)
+    await mgr.start()
+    backend = mgr.get_backend_unsafe()
+
+    result = await mgr.unload()
+    assert result["status"] == "unloaded"
+    assert result["resident_providers"] == []
+    assert mgr.state == BackendState.UNLOADED
+    assert backend.unloaded is True
+    assert unloads == [backend]
+    assert mgr.status()["resident"] is False
+    with pytest.raises(HTTPException) as ei:
+        mgr.get_backend_unsafe()
+    assert ei.value.status_code == 503
+
+    result = await mgr.reload("p-new")
+    assert result["status"] == "reloaded"
+    assert mgr.state == BackendState.READY
+    assert mgr.status()["resident"] is True
+    assert mgr.status()["provider"] == "p-old"
+
+
+@asynctest
 async def test_reload_waits_for_inflight_drain():
     mgr = _make_mgr(drain_timeout_s=5.0)
     await mgr.start()
@@ -486,11 +511,15 @@ async def test_status_shape():
     assert set(s.keys()) == {
         "state",
         "profile_name",
+        "provider",
+        "resident",
         "backend_name",
         "inflight_http",
         "inflight_ws",
     }
     assert s["state"] == "ready"
+    assert s["resident"] is True
+    assert s["provider"] == "p-old"
     assert s["inflight_http"] == 0
     assert s["inflight_ws"] == 0
     assert s["backend_name"]

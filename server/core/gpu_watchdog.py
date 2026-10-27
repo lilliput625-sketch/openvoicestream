@@ -158,8 +158,13 @@ def _detect_platform() -> str:
         # devfreq exists on many ARM SoCs; treat as RK only when there's
         # an actual NPU sysfs hint or env. We already covered env hints
         # above; without those, fall through.
-        if Path("/sys/kernel/debug/rknpu").exists():
-            return _PLATFORM_RK
+        try:
+            if Path("/sys/kernel/debug/rknpu").exists():
+                return _PLATFORM_RK
+        except OSError:
+            # Jetson images may mount debugfs without granting the service user
+            # access. Absence of readable NPU evidence is not a watchdog failure.
+            pass
 
     if Path("/etc/nv_tegra_release").exists():
         return _PLATFORM_JETSON
