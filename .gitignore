@@ -119,3 +119,6 @@ validation/
 # devices. Their immutable hashes belong in release locks; payload bytes are
 # published to the artifact registry and must never enter git.
 artifacts-local/
+
+# Local runtime logs
+server.log
